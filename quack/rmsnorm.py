@@ -114,6 +114,9 @@ class RMSNorm(ReductionBase):
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
         if cutlass.const_expr(mRstd is not None):
+            # 这里用了一个小trick让mRstd也能兼容tiler_mn
+            # mRstd的原始layout为(M):(1)，在送入kernel之前，手动把它的layout改为(M, N):(1, 0)
+            # shape和X一样，实现兼容tiler_mn；第二维的stride是0，保证同样行的所有tile都被映射到同一个内存地址上
             mRstd_expanded_layout = cute.append(
                 mRstd.layout, cute.make_layout((self.N,), stride=(0,))
             )
