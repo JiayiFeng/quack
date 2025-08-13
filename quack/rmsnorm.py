@@ -95,6 +95,20 @@ class RMSNorm(ReductionBase):
         assert mO.element_type == self.dtype
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
+        # Tile的划分方式：
+        # 0. block的大小完全由N（被reduce的维度）决定：
+        # N: block_dim_N: block_dim_M: cluster_n
+        # <= 64: 8: 16: 1
+        # <= 128: 16: 8: 1
+        # <= 3072: 32: 4: 1
+        # <= 6144: 64: 1: 1
+        # <= 16k: 128: 1: 1
+        # <= 32k: 256: 1: 2
+        # <= 64k: 256: 1: 4
+        # <= 128k: 256: 1: 8
+        # > 128k: 256: 1: 16
+        # 1. 每个block负责的tile shape为(block_dim_N, N // cluster_n)，也就是一行完全由一个block或者一个cluster负责
+        # 2. 每个thread每次copy和处理一行里的128个bits，当然如果block的tile shape比较大，thread会需要跳着在一行内进行多次copy和计算
         num_threads = cute.size(tv_layout, mode=[0])
         num_warps = num_threads // cute.arch.WARP_SIZE
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
@@ -132,18 +146,28 @@ class RMSNorm(ReductionBase):
         else:
             cluster_y = cutlass.const_expr(0)
 
+        # 申请shared memory上放x的空间
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
             mX.element_type,
             cute.make_ordered_layout(tiler_mn, order=(1, 0)),
             byte_alignment=16,
         )
+        # 在shared memory上申请reduce的buffer和可能的mbar
+        # mbar只有在cluster_n > 1时才会被申请和使用
+        # 具体cluster_n的取值搜索“_set_cluster_n”，主要原则是让每个block处理的宽度不超过16K
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         shape = mX.shape
+        # 构建一个和X shape一致、value就是当前element的coordinate的tensor，后面会用于产生predicate tensor
+        # predicate tensor的作用类似于Triton里的mask
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
+        # 理论上，用cute.local_tile就可以直接获得当前block对应的tile，但估计当tensor大于2^31元素时会有bug
+        # 因此这里采用一种迂回的方式：
+        #  1. 先用domain_offset_i64手动计算当前block对应的tile的起始位置，并将tensor的指针指向这个位置
+        #  2. 再用cute.local_tile获得第0个tile
         mX, mO = [utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mO)]
         gX, gO = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mX, mO)]
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
@@ -155,9 +179,12 @@ class RMSNorm(ReductionBase):
         )
 
         # declare the atoms which will be used later for memory copy
+        # CopyAtom定义对copy使用的PTX指令
+        # CopyUniversalOp根据dtype和num_bits 由编译器选择PTX同步拷贝指令
         copy_atom_load_X = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128
         )
+        # CopyG2SOp最终表示为cp.async.cg.shared指令
         copy_atom_load_X_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
         )
@@ -173,11 +200,12 @@ class RMSNorm(ReductionBase):
         copy_atom_store_O = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=num_bits_per_copy_O
         )
-
+        # TiledCopy是对一整个block要指令的copy行为的抽象，通过CopyAtom和tv_layout定义
+        # TiledCopy.get_slice获得当前thread要执行的copy行为的抽象
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(
             tidx
         )
-
+        # 获得各个Tensor由当前thread负责copy的slice
         tXgW = thr_copy_X.partition_S(gW)
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
@@ -186,27 +214,42 @@ class RMSNorm(ReductionBase):
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
+        # fragment就是register上的Tensor
         tXrW = cute.make_fragment_like(tXgW)
+        # 预先都置为0，保证OOB的部分不影响reduce计算结果
         tXrW.fill(0.0)
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
-
+        # mode就是PyTorch里的dim，tv_layout[0]的shape就是blockDim
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
-
+        # predicate就是Triton里的mask
         tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         row = tXcX[0][0]
         if row < shape[0]:
+            # 执行cp.async.cg.shared指令，将X和W从gmem拷贝到smem
             cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
 
         tXpW = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        # delay_w_load当前设置的是False，如果设置为True，会在真正用到W的之前再做cute.copy
+        # 猜测是打开delay_w_load可能降低一些register的占用。
+        # 但个人觉得如果编译器做的足够好，可能delay_w_load也意义不大，因为理论上不管什么时候调用cute.copy， 计算图都应该是一样的
         if cutlass.const_expr(not delay_w_load):
+            # 同步的将W从global直接拷贝到register
             cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
-
+        # 等待cp.async.cg.shared拷贝完成。说实话这里不太理解为什么不直接把X从global同步拷贝到register
         cute.arch.cp_async_wait_group(0)
+        # 将X从shared memory拷贝到register
+        # autovec_copy内部用的也是CopyAtomSIMTSyncCopyType，和cute.nvgpu.CopyUniversalOp类似，但能自动选择最优的num_bits_per_copy
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
         threads_per_row = tv_layout.shape[0][0]
+        # row_reduce内部分成三个层级进行reduce：
+        #  1. thread，直接在register上计算
+        #  2. warp，使用shuffle_sync_bfly指令reduce
+        #  3. block / cluster：
+        #    3.1 block: 每个warp将结果写入shm，用类似__syncthreads()同步 --> 再做一次warp reduce
+        #    3.2 cluster: 每个warp将结果写入cluster shm，用mbarrier同步（等待一定量的数据写入完成）--> 再做一次warp reduce
         sum_sq_x = utils.row_reduce(
             x * x,
             cute.ReductionOp.ADD,
@@ -227,6 +270,8 @@ class RMSNorm(ReductionBase):
                 tXrRstd[0] = rstd
         if cutlass.const_expr(delay_w_load):
             cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
+        # 可以选择reload x，而不是一直在寄存器里保存着x。打开后能能节省寄存器的使用，提升性能：
+        # https://github.com/Dao-AILab/quack/issues/6
         if cutlass.const_expr(reload_from == "smem"):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
@@ -300,6 +345,8 @@ def _rmsnorm_fwd(
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compile_key = (dtype, N, rstd is not None, weight.dtype)
+    # 这里手工构造了一个JIT Cache，因为虽然cute dsl会自动缓存编译结果，但性能不如这样手动操作一下好。
+    # 因为cute dsl JIT编译分成两个阶段：1. 构造IR，2.编译。cute dsl自动缓存只会跳过阶段2，不会自动跳过阶段1。
     if compile_key not in _rmsnorm_fwd.compile_cache:
         rmsnorm_op = RMSNorm(dtype, N)
         _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(

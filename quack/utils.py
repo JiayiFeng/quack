@@ -46,11 +46,13 @@ def block_reduce(
     val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0
 ) -> cute.Numeric:
     """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)"""
+    # 将每个warp的结果写入shared memory，然后在一个warp内再做一次warp_reduce
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row = cute.size(reduction_buffer.shape[1])
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx == 0:
         reduction_buffer[row_idx, col_idx] = val
+    # 这里barrier的效果类似于__syncthreads()
     cute.arch.barrier()
     block_reduce_val = init_val
     if lane_idx < warps_per_row:
@@ -130,6 +132,7 @@ def cluster_reduce(
     if warp_idx == 0:
         with cute.arch.elect_one():
             num_warps = rows_per_block * warps_per_row
+            # 当需要的数据量写入cluster shared memory是，自动触发barrier。实现cluster级别的同步
             cute.arch.mbarrier_arrive_and_expect_tx(
                 mbar_ptr,
                 num_warps * cluster_n * reduction_buffer.element_type.width // 8,
@@ -143,6 +146,7 @@ def cluster_reduce(
         )
     cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
     block_reduce_val = init_val
+    # 一个cluster内的warp数量可能超过32，所以先thread内进行一轮reduce再做warp_reduce
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
     for i in cutlass.range_constexpr(num_iter):
         idx = lane_idx + i * cute.arch.WARP_SIZE
@@ -180,6 +184,7 @@ def row_reduce(
 ) -> cute.Numeric:
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
+        # reduce当前thread内的数据
         val = x.reduce(op, init_val=init_val, reduction_profile=0)
     else:
         val = x
@@ -189,6 +194,7 @@ def row_reduce(
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
+    # warp reduce，内部用的是shuffle_sync_bfly指令
     val = warp_reduce(
         val,
         warp_op,
