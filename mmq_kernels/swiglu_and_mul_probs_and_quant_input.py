@@ -7,6 +7,15 @@ import math
 
 
 @cute.jit
+def _max(t: cute.TensorSSA, val: cute.Numeric) -> cute.TensorSSA:
+    tmp = cute.make_fragment(t.shape, t.dtype)
+    tmp.store(t)
+    for i in cutlass.range(cute.size(tmp.shape)):
+        tmp[i] = max(tmp[i], val)
+    return tmp.load()
+
+
+@cute.jit
 def _warp_max(
     val: cute.TensorSSA | cute.Numeric,
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
@@ -36,7 +45,7 @@ def _quant_x_to_fp8(
         reduction_profile=((None, (0, None)), None, None),
     )
     scale = _warp_max(scale, 32 // num_quant_chunks_per_warp)
-    scale = scale.to(cutlass.Float32) / cutlass.Float32(448.0) + eps
+    scale = _max(scale.to(cutlass.Float32) / cutlass.Float32(448.0), eps)
     inv_scale = cutlass.Float32(1.0) / scale
 
     # reshape scale to the x's shape
@@ -57,7 +66,7 @@ def _swiglu_and_mul_probs_and_quant_input_kernel(
     x_fp8_out: cute.Tensor,
     scale_out: cute.Tensor,
     eps: cutlass.Constexpr[float],
-    m: cutlass.Constexpr[int],
+    m: cutlass.Uint32,
     num_elems_per_thread: cutlass.Constexpr[int],
     warp_tile_n: cutlass.Constexpr[int],
     block_tiler_mn: cutlass.Constexpr[cute.Shape],
@@ -182,7 +191,7 @@ def _swiglu_and_mul_probs_and_quant_input_jit_func(
     out: cute.Tensor,
     x_fp8_out: cute.Tensor,
     scale_out: cute.Tensor,
-    m: cutlass.Constexpr[int],
+    m: cutlass.Uint32,
     n: cutlass.Constexpr[int],
     eps: cutlass.Constexpr[float],
     warp_tile_m: cutlass.Constexpr[int],
@@ -278,7 +287,7 @@ def swiglu_and_mul_probs_and_quant_input(
     num_warps_per_block = min(8, n // warp_tile_n)
     num_warps_per_sm = 64
 
-    compile_key = (m, n, eps)
+    compile_key = (n, eps)
     if compile_key not in _compile_cache:
         _compile_cache[compile_key] = cute.compile(
             _swiglu_and_mul_probs_and_quant_input_jit_func,
@@ -296,4 +305,4 @@ def swiglu_and_mul_probs_and_quant_input(
             num_warps_per_sm,
             num_sms,
         )
-    _compile_cache[compile_key](x_, probs_, out_, x_fp8_out_, scale_out_)
+    _compile_cache[compile_key](x_, probs_, out_, x_fp8_out_, scale_out_, m)
